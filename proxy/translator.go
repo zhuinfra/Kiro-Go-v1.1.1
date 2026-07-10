@@ -947,6 +947,58 @@ type OpenAITool struct {
 	} `json:"function"`
 }
 
+func (t *OpenAITool) UnmarshalJSON(data []byte) error {
+	type functionDef struct {
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		Parameters  interface{} `json:"parameters"`
+	}
+	type nestedTool struct {
+		Type     string      `json:"type"`
+		Function functionDef `json:"function"`
+	}
+
+	var nested nestedTool
+	if err := json.Unmarshal(data, &nested); err != nil {
+		return err
+	}
+	if nested.Function.Name != "" {
+		t.Type = nested.Type
+		if t.Type == "" {
+			t.Type = "function"
+		}
+		t.Function.Name = nested.Function.Name
+		t.Function.Description = nested.Function.Description
+		t.Function.Parameters = nested.Function.Parameters
+		return nil
+	}
+
+	type flatTool struct {
+		Type        string      `json:"type"`
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		Parameters  interface{} `json:"parameters"`
+	}
+
+	var flat flatTool
+	if err := json.Unmarshal(data, &flat); err != nil {
+		return err
+	}
+	if flat.Name != "" {
+		t.Type = flat.Type
+		if t.Type == "" {
+			t.Type = "function"
+		}
+		t.Function.Name = flat.Name
+		t.Function.Description = flat.Description
+		t.Function.Parameters = flat.Parameters
+		return nil
+	}
+
+	t.Type = nested.Type
+	return nil
+}
+
 type OpenAIResponse struct {
 	ID      string         `json:"id"`
 	Object  string         `json:"object"`

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -363,6 +364,82 @@ func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 	}
 	if schemaContainsKey(schema, "required") {
 		t.Fatalf("expected empty required field to be removed, got %#v", schema)
+	}
+}
+
+func TestOpenAIToolUnmarshalNestedFormat(t *testing.T) {
+	var tool OpenAITool
+	err := json.Unmarshal([]byte(`{
+		"type": "function",
+		"function": {
+			"name": "read_file",
+			"description": "Read a file",
+			"parameters": {"type": "object"}
+		}
+	}`), &tool)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if tool.Type != "function" {
+		t.Fatalf("expected function type, got %q", tool.Type)
+	}
+	if tool.Function.Name != "read_file" {
+		t.Fatalf("expected function name, got %q", tool.Function.Name)
+	}
+	if tool.Function.Description != "Read a file" {
+		t.Fatalf("expected function description, got %q", tool.Function.Description)
+	}
+	params, ok := tool.Function.Parameters.(map[string]interface{})
+	if !ok || params["type"] != "object" {
+		t.Fatalf("expected object parameters, got %#v", tool.Function.Parameters)
+	}
+}
+
+func TestOpenAIToolUnmarshalFlatFormat(t *testing.T) {
+	var tool OpenAITool
+	err := json.Unmarshal([]byte(`{
+		"name": "read_file",
+		"description": "Read a file",
+		"parameters": {"type": "object"}
+	}`), &tool)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if tool.Type != "function" {
+		t.Fatalf("expected missing flat type to default to function, got %q", tool.Type)
+	}
+	if tool.Function.Name != "read_file" {
+		t.Fatalf("expected function name, got %q", tool.Function.Name)
+	}
+	if tool.Function.Description != "Read a file" {
+		t.Fatalf("expected function description, got %q", tool.Function.Description)
+	}
+
+	tools := convertOpenAITools([]OpenAITool{tool})
+	if len(tools) != 1 {
+		t.Fatalf("expected flat tool to convert, got %d tools", len(tools))
+	}
+}
+
+func TestOpenAIToolUnmarshalNestedFormatDefaultsMissingType(t *testing.T) {
+	var tool OpenAITool
+	err := json.Unmarshal([]byte(`{
+		"function": {
+			"name": "search",
+			"parameters": {"type": "object"}
+		}
+	}`), &tool)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if tool.Type != "function" {
+		t.Fatalf("expected missing nested type to default to function, got %q", tool.Type)
+	}
+	if tool.Function.Name != "search" {
+		t.Fatalf("expected function name, got %q", tool.Function.Name)
 	}
 }
 

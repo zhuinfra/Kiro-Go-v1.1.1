@@ -203,6 +203,13 @@ type Config struct {
 	// Can be overridden by the LOG_LEVEL environment variable.
 	LogLevel string `json:"logLevel,omitempty"`
 
+	// Request log collection writes AI request metadata to an external-readable store.
+	RequestLogEnabled      *bool  `json:"requestLogEnabled,omitempty"`
+	RequestLogStore        string `json:"requestLogStore,omitempty"`
+	RequestLogDBPath       string `json:"requestLogDBPath,omitempty"`
+	RequestLogQueueSize    int    `json:"requestLogQueueSize,omitempty"`
+	RequestLogDropWhenFull *bool  `json:"requestLogDropWhenFull,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -592,6 +599,46 @@ func GetStats() (int, int, int, int, float64) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
+}
+
+type RequestLogConfig struct {
+	Enabled      bool
+	Store        string
+	DBPath       string
+	QueueSize    int
+	DropWhenFull bool
+}
+
+func GetRequestLogConfig() RequestLogConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	out := RequestLogConfig{
+		Enabled:      true,
+		Store:        "sqlite",
+		DBPath:       "request_logs.db",
+		QueueSize:    1000,
+		DropWhenFull: true,
+	}
+	if cfg == nil {
+		return out
+	}
+	if cfg.RequestLogEnabled != nil {
+		out.Enabled = *cfg.RequestLogEnabled
+	}
+	if cfg.RequestLogStore != "" {
+		out.Store = cfg.RequestLogStore
+	}
+	if cfg.RequestLogDBPath != "" {
+		out.DBPath = cfg.RequestLogDBPath
+	}
+	if cfg.RequestLogQueueSize > 0 {
+		out.QueueSize = cfg.RequestLogQueueSize
+	}
+	if cfg.RequestLogDropWhenFull != nil {
+		out.DropWhenFull = *cfg.RequestLogDropWhenFull
+	}
+	return out
 }
 
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {

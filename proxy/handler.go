@@ -37,6 +37,7 @@ type Handler struct {
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
+	requestLogger   *AsyncRequestLogger
 	tokenRefreshMu  sync.Mutex
 }
 
@@ -225,6 +226,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		requestLogger:   NewAsyncRequestLogger(),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -795,10 +797,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		newRequestLogBuilder(r, "claude", "", false, false, body, "invalid_json").finishError(h.requestLogger, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
 	if msg := validateClaudeRequestShape(&req); msg != "" {
+		newRequestLogBuilder(r, "claude", req.Model, req.Stream, false, body, summarizeClaudeRequest(&req)).finishError(h.requestLogger, 400, "invalid_request_error", msg)
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
@@ -814,24 +818,27 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
+	logb := newRequestLogBuilder(r, "claude", req.Model, req.Stream, thinking, body, summarizeClaudeRequest(&req))
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, logb)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, logb)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, logbs ...*requestLogBuilder) {
+	logb := firstRequestLogBuilder(logbs)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		logb.finishError(h.requestLogger, 500, "api_error", "Streaming not supported")
 		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
 		return
 	}
@@ -871,10 +878,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		attemptStart := time.Now()
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1200,10 +1209,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			if !messageStarted {
 				continue
 			}
 			h.recordFailure()
+			logb.finishError(h.requestLogger, 500, "api_error", err.Error())
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1241,6 +1252,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
+		logb.attempt(account, "success", nil, attempt+1, attemptStart)
+		logb.finishSuccess(h.requestLogger, account, 200, inputTokens, outputTokens, credits, outputContent, len(toolUses), stopReason, cacheUsage)
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1258,11 +1271,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		logb.finishError(h.requestLogger, 503, "api_error", "No available accounts")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	logb.finishError(h.requestLogger, 500, "api_error", lastErr.Error())
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1340,7 +1355,8 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, logbs ...*requestLogBuilder) {
+	logb := firstRequestLogBuilder(logbs)
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1349,10 +1365,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		attemptStart := time.Now()
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1392,6 +1410,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -1446,16 +1465,24 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		stopReason := "end_turn"
+		if len(toolUses) > 0 {
+			stopReason = "tool_use"
+		}
+		logb.attempt(account, "success", nil, attempt+1, attemptStart)
+		logb.finishSuccess(h.requestLogger, account, 200, inputTokens, outputTokens, credits, finalContent, len(toolUses), stopReason, cacheUsage)
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
 	if lastErr == nil {
+		logb.finishError(h.requestLogger, 503, "api_error", "No available accounts")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	logb.finishError(h.requestLogger, 500, "api_error", lastErr.Error())
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1486,10 +1513,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		newRequestLogBuilder(r, "openai_chat", "", false, false, body, "invalid_json").finishError(h.requestLogger, 400, "invalid_request_error", "Invalid JSON")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
 	if msg := validateOpenAIRequestShape(&req); msg != "" {
+		newRequestLogBuilder(r, "openai_chat", req.Model, req.Stream, false, body, summarizeOpenAIRequest(&req)).finishError(h.requestLogger, 400, "invalid_request_error", msg)
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
@@ -1501,23 +1530,26 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
+	logb := newRequestLogBuilder(r, "openai_chat", req.Model, req.Stream, thinking, body, summarizeOpenAIRequest(&req))
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, logb)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, logb)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, logbs ...*requestLogBuilder) {
+	logb := firstRequestLogBuilder(logbs)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		logb.finishError(h.requestLogger, 500, "server_error", "Streaming not supported")
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
 		return
 	}
@@ -1534,10 +1566,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		attemptStart := time.Now()
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -1827,10 +1861,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			if !responseStarted {
 				continue
 			}
 			h.recordFailure()
+			logb.finishError(h.requestLogger, 500, "server_error", err.Error())
 			return
 		}
 
@@ -1866,6 +1902,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
 		}
+		logb.attempt(account, "success", nil, attempt+1, attemptStart)
+		logb.finishSuccess(h.requestLogger, account, 200, inputTokens, outputTokens, credits, outputContent, len(toolCalls), finishReason, promptCacheUsage{})
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -1891,16 +1929,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		logb.finishError(h.requestLogger, 503, "server_error", "No available accounts")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	logb.finishError(h.requestLogger, 500, "server_error", lastErr.Error())
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, logbs ...*requestLogBuilder) {
+	logb := firstRequestLogBuilder(logbs)
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1909,10 +1950,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if account == nil {
 			break
 		}
+		attemptStart := time.Now()
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -1944,6 +1987,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -1968,16 +2012,24 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		finishReason := "stop"
+		if len(toolUses) > 0 {
+			finishReason = "tool_calls"
+		}
+		logb.attempt(account, "success", nil, attempt+1, attemptStart)
+		logb.finishSuccess(h.requestLogger, account, 200, inputTokens, outputTokens, credits, finalContent, len(toolUses), finishReason, promptCacheUsage{})
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
 	if lastErr == nil {
+		logb.finishError(h.requestLogger, 503, "server_error", "No available accounts")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailure()
+	logb.finishError(h.requestLogger, 500, "server_error", lastErr.Error())
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2138,6 +2190,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdatePromptFilter(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
+	case path == "/request-logs/health" && r.Method == "GET":
+		h.apiRequestLogsHealth(w, r)
 	case path == "/export" && r.Method == "POST":
 		h.apiExportAccounts(w, r)
 	case path == "/api-keys" && r.Method == "GET":

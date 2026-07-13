@@ -26,6 +26,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	var req ResponsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		newRequestLogBuilder(r, "openai_responses", "", false, false, body, "invalid_json").finishError(h.requestLogger, 400, "invalid_request_error", "Invalid JSON")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
@@ -45,6 +46,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	if req.PreviousResponseID != "" {
 		prev, loadErr := loadResponse(req.PreviousResponseID)
 		if loadErr != nil {
+			newRequestLogBuilder(r, "openai_responses", req.Model, req.Stream, false, body, "previous_response_id").finishError(h.requestLogger, 404, "invalid_request_error", fmt.Sprintf("previous_response_id not found: %v", loadErr))
 			h.sendOpenAIError(w, 404, "invalid_request_error",
 				fmt.Sprintf("previous_response_id not found: %v", loadErr))
 			return
@@ -54,6 +56,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	inputMessages, err := parseResponsesInput(req.Input)
 	if err != nil {
+		newRequestLogBuilder(r, "openai_responses", req.Model, req.Stream, false, body, "invalid_input").finishError(h.requestLogger, 400, "invalid_request_error", err.Error())
 		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
@@ -74,6 +77,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	finalMessages = append(finalMessages, inputMessages...)
 
 	if len(finalMessages) == 0 {
+		newRequestLogBuilder(r, "openai_responses", req.Model, req.Stream, false, body, summarizeResponsesRequest(&req, finalMessages)).finishError(h.requestLogger, 400, "invalid_request_error", "input must contain at least one message")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "input must contain at least one message")
 		return
 	}
@@ -86,6 +90,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	if !hasUser {
+		newRequestLogBuilder(r, "openai_responses", req.Model, req.Stream, false, body, summarizeResponsesRequest(&req, finalMessages)).finishError(h.requestLogger, 400, "invalid_request_error", "input must contain at least one user message")
 		h.sendOpenAIError(w, 400, "invalid_request_error", "input must contain at least one user message")
 		return
 	}
@@ -112,22 +117,25 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
+	logb := newRequestLogBuilder(r, "openai_responses", actualModel, req.Stream, thinking, body, summarizeResponsesRequest(&req, finalMessages))
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, respID, &req, storedInputCopy, storeResponse, logb)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, respID, &req, storedInputCopy, storeResponse, logb)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	logbs ...*requestLogBuilder,
 ) {
+	logb := firstRequestLogBuilder(logbs)
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -136,10 +144,12 @@ func (h *Handler) handleResponsesNonStream(
 		if account == nil {
 			break
 		}
+		attemptStart := time.Now()
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -170,6 +180,7 @@ func (h *Handler) handleResponsesNonStream(
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -200,15 +211,23 @@ func (h *Handler) handleResponsesNonStream(
 		}
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		stopReason := "stop"
+		if len(toolUses) > 0 {
+			stopReason = "tool_calls"
+		}
+		logb.attempt(account, "success", nil, attempt+1, attemptStart)
+		logb.finishSuccess(h.requestLogger, account, 200, inputTokens, outputTokens, credits, finalContent, len(toolUses), stopReason, promptCacheUsage{})
 		_ = json.NewEncoder(w).Encode(respObj)
 		return
 	}
 
 	if lastErr == nil {
+		logb.finishError(h.requestLogger, 503, "server_error", "No available accounts")
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 	h.recordFailure()
+	logb.finishError(h.requestLogger, 500, "server_error", lastErr.Error())
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -273,13 +292,16 @@ func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	logbs ...*requestLogBuilder,
 ) {
+	logb := firstRequestLogBuilder(logbs)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		logb.finishError(h.requestLogger, 500, "server_error", "Streaming not supported")
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
 		return
 	}
@@ -319,10 +341,12 @@ func (h *Handler) handleResponsesStream(
 		if account == nil {
 			break
 		}
+		attemptStart := time.Now()
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
 			continue
 		}
 
@@ -473,8 +497,11 @@ func (h *Handler) handleResponsesStream(
 				lastErr = err
 				excluded[account.ID] = true
 				h.handleAccountFailure(account, err)
+				logb.attempt(account, "error", err, attempt+1, attemptStart)
 				continue
 			}
+			logb.attempt(account, "error", err, attempt+1, attemptStart)
+			logb.finishError(h.requestLogger, 500, "server_error", err.Error())
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
@@ -545,6 +572,12 @@ func (h *Handler) handleResponsesStream(
 			}
 		}
 
+		stopReason := "stop"
+		if len(toolUses) > 0 {
+			stopReason = "tool_calls"
+		}
+		logb.attempt(account, "success", nil, attempt+1, attemptStart)
+		logb.finishSuccess(h.requestLogger, account, 200, inputTokens, outputTokens, credits, finalContent, len(toolUses), stopReason, promptCacheUsage{})
 		send("response.completed", map[string]interface{}{
 			"type":     "response.completed",
 			"response": respObj,
@@ -555,6 +588,7 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
+		logb.finishError(h.requestLogger, 503, "server_error", "No available accounts")
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -569,6 +603,7 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 	h.recordFailure()
+	logb.finishError(h.requestLogger, 500, "server_error", lastErr.Error())
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
